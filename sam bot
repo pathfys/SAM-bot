@@ -39,7 +39,7 @@ BOT_TOKEN      = "8556040583:AAH4alGtztA9F4kWTL1QIh2W-oP-0EYrmR0"
 ADMIN_IDS      = [8509231132]          # список ID администраторов
 LOG_CHANNEL_ID = -1003780614361         # канал логов (заявки)
 PAY_CHANNEL_ID = -1003754552673         # канал выплат
-WEBAPP_URL     = "https://ТВОЙ_ДОМЕН"   # ссылка на SAM WebApp
+WEBAPP_URL     = WEBAPP_URL = "https://fountain-manner-lessons-realtors.trycloudflare.com"
 
 # ═══════════════════════════════════════════
 #  LOGGING
