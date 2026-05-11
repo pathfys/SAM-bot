@@ -1,0 +1,523 @@
+"""
+SAM Payroll Bot — aiogram 3.x + SQLite
+=======================================
+Установка:
+    pip install aiogram==3.* aiosqlite
+
+Запуск:
+    python sam_bot.py
+
+Переменные (вставь свои значения в CONFIG ниже):
+    BOT_TOKEN       — токен бота от @BotFather
+    ADMIN_IDS       — список Telegram ID администраторов
+    LOG_CHANNEL_ID  — ID канала куда падают заявки
+    PAY_CHANNEL_ID  — ID канала успешных выплат
+    WEBAPP_URL      — ссылка на твой WebApp (SAM мини-апп)
+"""
+
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
+
+# ═══════════════════════════════════════════
+#  CONFIG — вставь свои значения
+# ═══════════════════════════════════════════
+BOT_TOKEN      = "8556040583:AAH4alGtztA9F4kWTL1QIh2W-oP-0EYrmR0"
+ADMIN_IDS      = [8509231132]          # список ID администраторов
+LOG_CHANNEL_ID = -1003780614361         # канал логов (заявки)
+PAY_CHANNEL_ID = -1003754552673         # канал выплат
+WEBAPP_URL     = "https://ТВОЙ_ДОМЕН"   # ссылка на SAM WebApp
+
+# ═══════════════════════════════════════════
+#  LOGGING
+# ═══════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════
+DB_PATH = "sam.db"
+
+
+def db_init():
+    """Создаём таблицы при первом запуске."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    # Пользователи
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            uid         INTEGER PRIMARY KEY,
+            username    TEXT,
+            full_name   TEXT,
+            profits     INTEGER DEFAULT 0,
+            total_ton   REAL    DEFAULT 0,
+            wallet      TEXT    DEFAULT '',
+            joined_at   TEXT    DEFAULT ''
+        )
+    """)
+
+    # Заявки
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            req_id      TEXT    PRIMARY KEY,
+            uid         INTEGER,
+            method      TEXT,
+            ton_address TEXT,
+            links       TEXT,
+            status      TEXT    DEFAULT 'pending',
+            ton_amount  REAL    DEFAULT 0,
+            created_at  TEXT,
+            msg_id      INTEGER DEFAULT 0
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+
+def db_upsert_user(uid: int, username: str, full_name: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT INTO users (uid, username, full_name, joined_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+            username  = excluded.username,
+            full_name = excluded.full_name
+    """, (uid, username or "", full_name, datetime.now().strftime("%d.%m.%Y")))
+    con.commit()
+    con.close()
+
+
+def db_get_user(uid: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def db_save_request(req_id, uid, method, ton_address, links, msg_id=0):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT OR REPLACE INTO requests
+            (req_id, uid, method, ton_address, links, status, created_at, msg_id)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    """, (req_id, uid, method, ton_address, links,
+          datetime.now().strftime("%d.%m.%Y %H:%M"), msg_id))
+    con.commit()
+    con.close()
+
+
+def db_get_request(req_id: str) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM requests WHERE req_id=?", (req_id,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def db_set_status(req_id: str, status: str, ton_amount: float = 0):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        UPDATE requests SET status=?, ton_amount=? WHERE req_id=?
+    """, (status, ton_amount, req_id))
+    if status == "paid" and ton_amount > 0:
+        req = db_get_request(req_id)
+        if req:
+            con.execute("""
+                UPDATE users
+                SET profits  = profits  + 1,
+                    total_ton = total_ton + ?
+                WHERE uid = ?
+            """, (ton_amount, req["uid"]))
+    con.commit()
+    con.close()
+
+
+def db_get_rank(profits: int) -> str:
+    ranks = [
+        (100, "Мастер"),
+        (60,  "Эксперт"),
+        (30,  "Специалист"),
+        (15,  "Работник"),
+        (5,   "Стажёр"),
+        (0,   "Новичок"),
+    ]
+    for min_p, name in ranks:
+        if profits >= min_p:
+            return name
+    return "Новичок"
+
+
+# ═══════════════════════════════════════════
+#  BOT + DISPATCHER
+# ═══════════════════════════════════════════
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher()
+
+
+# ───────────────────────────────────────────
+#  /start
+# ───────────────────────────────────────────
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user = message.from_user
+    db_upsert_user(user.id, user.username, user.full_name)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🚀 Перейти в SAM",
+            web_app=WebAppInfo(url=WEBAPP_URL)
+        )
+    ]])
+
+    await message.answer(
+        f"Привет, {user.first_name}!\n\n"
+        f"Перейди в SAM 👇",
+        reply_markup=kb,
+    )
+
+
+# ───────────────────────────────────────────
+#  Клавиатура для заявки (в канал логов)
+# ───────────────────────────────────────────
+def request_kb(req_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Выплатить",      callback_data=f"pay:{req_id}")
+    builder.button(text="❌ Отклонить",      callback_data=f"rej:{req_id}")
+    builder.button(text="👤 Профиль",        callback_data=f"prof:{req_id}")
+    builder.adjust(2, 1)   # первые две в ряд, третья отдельно
+    return builder.as_markup()
+
+
+# ───────────────────────────────────────────
+#  Клавиатура подтверждения выплаты
+# ───────────────────────────────────────────
+def confirm_pay_kb(req_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    # Быстрые суммы
+    for ton in ["1", "2", "5", "10", "20", "50"]:
+        builder.button(
+            text=f"💎 {ton} TON",
+            callback_data=f"dopay:{req_id}:{ton}"
+        )
+    builder.button(text="✏️ Своя сумма",  callback_data=f"custom:{req_id}")
+    builder.button(text="◀️ Назад",       callback_data=f"back:{req_id}")
+    builder.adjust(3, 3, 1, 1)
+    return builder.as_markup()
+
+
+# ───────────────────────────────────────────
+#  Функция отправки заявки в канал логов
+#  (вызывается из WebApp через sendData или
+#   напрямую через Telegram Bot API из JS)
+# ───────────────────────────────────────────
+async def send_request_to_log(
+    req_id: str,
+    uid: int,
+    full_name: str,
+    username: str,
+    method: str,
+    ton_address: str,
+    links: list[str],
+):
+    """Отправляет заявку в LOG_CHANNEL с кнопками."""
+    method_label = "🤖 ОТС Бот" if method == "ots" else "🛡️ Живой гарант"
+    links_fmt    = "\n".join(f"{i+1}. {l}" for i, l in enumerate(links))
+    now          = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    text = (
+        f"🆕 <b>Новая заявка на выплату</b>\n"
+        f"🆔 <b>Заявка:</b> <code>{req_id}</code>\n\n"
+        f"👤 <b>Пользователь:</b> {full_name}\n"
+        f"🔗 <b>Username:</b> {username}\n"
+        f"🆔 <b>TG ID:</b> <code>{uid}</code>\n\n"
+        f"💳 <b>Метод:</b> {method_label}\n"
+        f"💎 <b>TON Адрес:</b>\n<code>{ton_address}</code>\n\n"
+        f"🎁 <b>Ссылки ({len(links)} шт.):</b>\n{links_fmt}\n\n"
+        f"🕐 <b>Время:</b> {now} (МСК)"
+    )
+
+    sent = await bot.send_message(
+        chat_id=LOG_CHANNEL_ID,
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=request_kb(req_id),
+    )
+
+    db_save_request(req_id, uid, method, ton_address,
+                    "\n".join(links), msg_id=sent.message_id)
+    return sent.message_id
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: ✅ Выплатить
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("pay:"))
+async def cb_pay(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    req_id = call.data.split(":", 1)[1]
+    req    = db_get_request(req_id)
+    if not req:
+        return await call.answer("❌ Заявка не найдена", show_alert=True)
+    if req["status"] != "pending":
+        return await call.answer(
+            f"Заявка уже обработана: {req['status']}", show_alert=True
+        )
+
+    await call.message.edit_reply_markup(reply_markup=confirm_pay_kb(req_id))
+    await call.answer("Выбери сумму 👇")
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: 💎 Быстрая сумма
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("dopay:"))
+async def cb_dopay(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    _, req_id, ton_str = call.data.split(":", 2)
+    ton_amount = float(ton_str)
+    await _finalize_payout(call, req_id, ton_amount)
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: ✏️ Своя сумма — просим написать
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("custom:"))
+async def cb_custom(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    req_id = call.data.split(":", 1)[1]
+    # Сохраняем req_id во временное сообщение (простой способ без FSM)
+    await call.message.reply(
+        f"✏️ Напиши сумму в TON для заявки <code>{req_id}</code>\n"
+        f"Пример: <code>pay {req_id} 7.5</code>",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+# ───────────────────────────────────────────
+#  Команда: pay REQ-XXX 7.5
+# ───────────────────────────────────────────
+@dp.message(F.text.startswith("pay "))
+async def cmd_pay_manual(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        return await message.reply("❗ Формат: <code>pay REQ-XXX 7.5</code>", parse_mode="HTML")
+
+    _, req_id, ton_str = parts
+    try:
+        ton_amount = float(ton_str)
+    except ValueError:
+        return await message.reply("❗ Некорректная сумма")
+
+    req = db_get_request(req_id)
+    if not req:
+        return await message.reply("❌ Заявка не найдена")
+    if req["status"] != "pending":
+        return await message.reply(f"Заявка уже обработана: {req['status']}")
+
+    await _do_payout(req_id, ton_amount, admin_id=message.from_user.id)
+    await message.reply(f"✅ Выплата {ton_amount} TON по заявке {req_id} зачтена!")
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: ❌ Отклонить
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("rej:"))
+async def cb_reject(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    req_id = call.data.split(":", 1)[1]
+    req    = db_get_request(req_id)
+    if not req:
+        return await call.answer("❌ Заявка не найдена", show_alert=True)
+    if req["status"] != "pending":
+        return await call.answer(
+            f"Заявка уже обработана: {req['status']}", show_alert=True
+        )
+
+    db_set_status(req_id, "rejected")
+
+    # Редактируем сообщение в канале
+    try:
+        await call.message.edit_text(
+            call.message.html_text + "\n\n❌ <b>ОТКЛОНЕНО</b>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        pass
+
+    # Уведомляем воркера
+    try:
+        await bot.send_message(
+            req["uid"],
+            f"❌ <b>Заявка {req_id} отклонена.</b>\n\n"
+            f"Обратитесь к администратору за подробностями.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await call.answer("Заявка отклонена", show_alert=True)
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: 👤 Профиль воркера
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("prof:"))
+async def cb_profile(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    req_id = call.data.split(":", 1)[1]
+    req    = db_get_request(req_id)
+    if not req:
+        return await call.answer("❌ Заявка не найдена", show_alert=True)
+
+    user = db_get_user(req["uid"])
+    if not user:
+        return await call.answer("👤 Пользователь не найден", show_alert=True)
+
+    rank        = db_get_rank(user["profits"])
+    payout_pct  = 65 if user["profits"] >= 60 else 60
+    username    = f"@{user['username']}" if user["username"] else "(без username)"
+
+    text = (
+        f"👤 <b>Профиль воркера</b>\n\n"
+        f"🆔 <b>ID:</b> <code>{user['uid']}</code>\n"
+        f"👤 <b>Имя:</b> {user['full_name']}\n"
+        f"🔗 <b>Username:</b> {username}\n\n"
+        f"⭐️ <b>Ранг:</b> {rank}\n"
+        f"📊 <b>Профитов:</b> {user['profits']}\n"
+        f"💎 <b>Всего выплачено:</b> {user['total_ton']:.2f} TON\n"
+        f"💳 <b>Ставка:</b> {payout_pct}%\n"
+        f"📅 <b>Регистрация:</b> {user['joined_at']}\n"
+        f"💼 <b>Кошелёк:</b> <code>{user['wallet'] or 'не привязан'}</code>"
+    )
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:{req_id}")
+    ]])
+
+    await call.message.reply(text, parse_mode="HTML", reply_markup=back_kb)
+    await call.answer()
+
+
+# ───────────────────────────────────────────
+#  CALLBACK: ◀️ Назад (к кнопкам заявки)
+# ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("back:"))
+async def cb_back(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("⛔️ Нет доступа", show_alert=True)
+
+    req_id = call.data.split(":", 1)[1]
+    try:
+        await call.message.edit_reply_markup(reply_markup=request_kb(req_id))
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+# ───────────────────────────────────────────
+#  Внутренняя: финализация выплаты (callback)
+# ───────────────────────────────────────────
+async def _finalize_payout(call: CallbackQuery, req_id: str, ton_amount: float):
+    await _do_payout(req_id, ton_amount, admin_id=call.from_user.id)
+
+    try:
+        await call.message.edit_text(
+            call.message.html_text.split("\n\n✅")[0]
+            + f"\n\n✅ <b>ВЫПЛАЧЕНО: {ton_amount} TON</b>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        pass
+
+    await call.answer(f"✅ Выплата {ton_amount} TON зачтена!", show_alert=True)
+
+
+async def _do_payout(req_id: str, ton_amount: float, admin_id: int):
+    req  = db_get_request(req_id)
+    db_set_status(req_id, "paid", ton_amount)
+
+    user = db_get_user(req["uid"])
+    rank = db_get_rank(user["profits"] + 1 if user else 1)
+    method_label = "ОТС Бот" if req["method"] == "ots" else "Живой гарант"
+
+    # Канал выплат
+    await bot.send_message(
+        PAY_CHANNEL_ID,
+        f"✅ <b>Успешная выплата!</b>\n\n"
+        f"<blockquote>"
+        f"👤 Воркер: скрыт\n"
+        f"🔧 Инструмент: {method_label}\n"
+        f"💎 Сумма: {ton_amount} TON\n"
+        f"⭐️ Уровень: {rank}"
+        f"</blockquote>",
+        parse_mode="HTML",
+    )
+
+    # Уведомление воркеру
+    try:
+        await bot.send_message(
+            req["uid"],
+            f"✅ <b>Заявка {req_id} выплачена!</b>\n\n"
+            f"💎 Сумма: <b>{ton_amount} TON</b>\n"
+            f"⭐️ Твой ранг: <b>{rank}</b>\n\n"
+            f"Открой приложение чтобы увидеть обновлённый статус 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🚀 Открыть SAM",
+                    web_app=WebAppInfo(url=WEBAPP_URL)
+                )
+            ]]),
+        )
+    except Exception as e:
+        log.warning(f"Не удалось уведомить воркера {req['uid']}: {e}")
+
+
+# ═══════════════════════════════════════════
+#  ЗАПУСК
+# ═══════════════════════════════════════════
+async def main():
+    db_init()
+    log.info("SAM Bot запущен ✅")
+    await dp.start_polling(bot, skip_updates=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
