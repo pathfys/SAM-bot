@@ -197,41 +197,34 @@ async def handle_webapp_data(message: Message):
         req_id      = data["req_id"]
         method      = data["method"]
         ton_address = data["ton_address"]
-        links       = data["links"]  # должен быть list[str]
+        links       = data["links"]
+        msg_id      = data.get("msg_id", 0)  # msg_id уже отправленного JS-ом сообщения
 
-        # Если вдруг links пришёл строкой — превращаем в список
         if isinstance(links, str):
             links = [l.strip() for l in links.split("\n") if l.strip()]
 
         uid       = message.from_user.id
         full_name = message.from_user.full_name
-        username  = f"@{message.from_user.username}" if message.from_user.username else "(без username)"
+        username  = message.from_user.username or ""
 
-        db_upsert_user(uid, message.from_user.username, full_name)
+        db_upsert_user(uid, username, full_name)
 
-        await send_request_to_log(
-            req_id=req_id,
-            uid=uid,
-            full_name=full_name,
-            username=username,
-            method=method,
-            ton_address=ton_address,
-            links=links,
-        )
+        # Сохраняем в БД с msg_id от JS — НЕ отправляем в канал повторно
+        links_str = "\n".join(links)
+        db_save_request(req_id, uid, method, ton_address, links_str, msg_id=msg_id)
 
+        log.info(f"Заявка {req_id} сохранена в БД, msg_id={msg_id}")
         await message.answer(f"✅ Заявка {req_id} принята на обработку!")
 
     except json.JSONDecodeError as e:
-        log.error(f"Ошибка парсинга JSON: {e} | raw={message.web_app_data.data}")
+        log.error(f"Ошибка парсинга JSON: {e}")
         await message.answer("❌ Ошибка: некорректные данные от приложения")
     except KeyError as e:
-        log.error(f"Отсутствует поле {e} в данных WebApp")
+        log.error(f"Отсутствует поле {e}")
         await message.answer("❌ Ошибка: неполные данные заявки")
     except Exception as e:
-        log.exception(f"Неожиданная ошибка в handle_webapp_data: {e}")
+        log.exception(f"Неожиданная ошибка: {e}")
         await message.answer("❌ Внутренняя ошибка. Попробуйте ещё раз.")
-
-
 # ───────────────────────────────────────────
 #  Клавиатура для заявки (в канал логов)
 # ───────────────────────────────────────────
