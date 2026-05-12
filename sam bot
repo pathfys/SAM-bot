@@ -32,8 +32,8 @@ from aiogram.exceptions import TelegramBadRequest
 BOT_TOKEN      = "8556040583:AAH4alGtztA9F4kWTL1QIh2W-oP-0EYrmR0"
 ADMIN_IDS      = [8509231132]
 LOG_CHANNEL_ID = -1003780614361
-PAY_CHANNEL_ID = -1003754552673
-WEBAPP_URL     = "https://fountain-manner-lessons-realtors.trycloudflare.com"
+PAY_CHANNEL_ID = -1003775233889
+WEBAPP_URL     = "https://responsibility-once-amazing-depend.trycloudflare.com"
 
 # ═══════════════════════════════════════════
 #  LOGGING
