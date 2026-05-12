@@ -554,13 +554,54 @@ async def _do_payout(req_id: str, ton_amount: float):
         log.warning(f"Не удалось уведомить воркера {req['uid']}: {e}")
 
 
-# ═══════════════════════════════════════════
-#  ЗАПУСК
-# ═══════════════════════════════════════════
+
+from aiohttp import web
+
+async def handle_save_request(request):
+    try:
+        data = await request.json()
+        
+        req_id      = data["req_id"]
+        uid         = data["uid"]
+        method      = data["method"]
+        ton_address = data["ton_address"]
+        links       = data["links"]
+        msg_id      = data.get("msg_id", 0)
+        username    = data.get("username", "")
+        full_name   = data.get("full_name", "")
+
+        if isinstance(links, list):
+            links_str = "\n".join(links)
+        else:
+            links_str = links
+
+        db_upsert_user(uid, username, full_name)
+        db_save_request(req_id, uid, method, ton_address, links_str, msg_id=msg_id)
+        
+        log.info(f"[API] Заявка {req_id} сохранена в БД, uid={uid}, msg_id={msg_id}")
+        return web.json_response({"ok": True})
+
+    except Exception as e:
+        log.exception(f"[API] Ошибка сохранения заявки: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
 async def main():
     db_init()
     log.info("SAM Bot запущен ✅")
+
+    # Запускаем HTTP сервер для приёма заявок от WebApp
+    app = web.Application()
+    app.router.add_post("/save_request", handle_save_request)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    log.info("HTTP сервер запущен на порту 8080 ✅")
+
     await dp.start_polling(bot, skip_updates=True)
+
+
 
 
 if __name__ == "__main__":
