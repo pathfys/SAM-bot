@@ -191,14 +191,12 @@ async def handle_webapp_data(message: Message):
     try:
         raw  = message.web_app_data.data
         log.info(f"WebApp data от {message.from_user.id}: {raw}")
-
         data = json.loads(raw)
 
         req_id      = data["req_id"]
         method      = data["method"]
         ton_address = data["ton_address"]
         links       = data["links"]
-        msg_id      = data.get("msg_id", 0)  # msg_id уже отправленного JS-ом сообщения
 
         if isinstance(links, str):
             links = [l.strip() for l in links.split("\n") if l.strip()]
@@ -209,11 +207,21 @@ async def handle_webapp_data(message: Message):
 
         db_upsert_user(uid, username, full_name)
 
-        # Сохраняем в БД с msg_id от JS — НЕ отправляем в канал повторно
-        links_str = "\n".join(links)
-        db_save_request(req_id, uid, method, ton_address, links_str, msg_id=msg_id)
+        # Проверяем — вдруг уже сохранена через /save_request
+        existing = db_get_request(req_id)
+        if existing:
+            log.info(f"Заявка {req_id} уже в БД, пропускаем дублирование")
+            await message.answer(f"✅ Заявка {req_id} уже принята!")
+            return
 
-        log.info(f"Заявка {req_id} сохранена в БД, msg_id={msg_id}")
+        # Сохраняем и отправляем в канал
+        msg_id = await send_request_to_log(
+            req_id, uid, full_name,
+            f"@{username}" if username else "(без username)",
+            method, ton_address, links,
+        )
+
+        log.info(f"Заявка {req_id} сохранена через WebApp, msg_id={msg_id}")
         await message.answer(f"✅ Заявка {req_id} принята на обработку!")
 
     except json.JSONDecodeError as e:
@@ -570,21 +578,28 @@ async def handle_save_request(request):
         username    = data.get("username", "")
         full_name   = data.get("full_name", "")
 
-        if isinstance(links, list):
-            links_str = "\n".join(links)
-        else:
-            links_str = links
+        links_str = "\n".join(links) if isinstance(links, list) else links
 
-        db_upsert_user(uid, username, full_name)
-        db_save_request(req_id, uid, method, ton_address, links_str, msg_id=msg_id)
+        db_upsert_user(int(uid), username, full_name)
         
-        log.info(f"[API] Заявка {req_id} сохранена в БД, uid={uid}, msg_id={msg_id}")
+        # Если уже есть — просто обновляем msg_id
+        existing = db_get_request(req_id)
+        if existing:
+            if msg_id and existing["msg_id"] == 0:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE requests SET msg_id=? WHERE req_id=?", (msg_id, req_id))
+                con.commit()
+                con.close()
+            log.info(f"[API] Заявка {req_id} уже в БД, обновлён msg_id")
+            return web.json_response({"ok": True})
+
+        db_save_request(req_id, int(uid), method, ton_address, links_str, msg_id=msg_id)
+        log.info(f"[API] Заявка {req_id} сохранена, uid={uid}, msg_id={msg_id}")
         return web.json_response({"ok": True})
 
     except Exception as e:
         log.exception(f"[API] Ошибка сохранения заявки: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=400)
-
 
 async def handle_get_user_requests(request):
     try:
