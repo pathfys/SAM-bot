@@ -586,6 +586,36 @@ async def handle_save_request(request):
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
+async def handle_get_user_requests(request):
+    try:
+        uid = request.rel_url.query.get("uid")
+        if not uid:
+            return web.json_response({"ok": False, "error": "no uid"}, status=400)
+
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT req_id, status, ton_amount FROM requests WHERE uid=? ORDER BY created_at DESC LIMIT 50",
+            (int(uid),)
+        ).fetchall()
+        con.close()
+
+        requests_list = [
+            {
+                "req_id":     row["req_id"],
+                "status":     row["status"],
+                "ton_amount": row["ton_amount"] or 0,
+            }
+            for row in rows
+        ]
+
+        return web.json_response({"ok": True, "requests": requests_list})
+
+    except Exception as e:
+        log.exception(f"[API] Ошибка get_user_requests: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
 async def main():
     db_init()
     log.info("SAM Bot запущен ✅")
@@ -593,6 +623,7 @@ async def main():
     # Запускаем HTTP сервер для приёма заявок от WebApp
     app = web.Application()
     app.router.add_post("/save_request", handle_save_request)
+    app.router.add_get("/get_user_requests", handle_get_user_requests)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
