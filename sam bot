@@ -2,7 +2,7 @@
 SAM Payroll Bot — aiogram 3.x + SQLite
 =======================================
 Установка:
-    pip install aiogram==3.* aiosqlite
+    pip install aiogram==3.* aiosqlite aiohttp
 
 Запуск:
     python sam_bot.py
@@ -11,6 +11,7 @@ SAM Payroll Bot — aiogram 3.x + SQLite
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime
 
@@ -25,9 +26,10 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+from aiohttp import web
 
 # ═══════════════════════════════════════════
-#  CONFIG
+#  КОНФИГ
 # ═══════════════════════════════════════════
 BOT_TOKEN      = "8556040583:AAH4alGtztA9F4kWTL1QIh2W-oP-0EYrmR0"
 ADMIN_IDS      = [8509231132]
@@ -36,7 +38,7 @@ PAY_CHANNEL_ID = -1003775233889
 WEBAPP_URL     = "https://responsibility-once-amazing-depend.trycloudflare.com"
 
 # ═══════════════════════════════════════════
-#  LOGGING
+#  ЛОГГЕР
 # ═══════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +47,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════
-#  DATABASE
+#  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════
 DB_PATH = "sam.db"
 
@@ -156,10 +158,53 @@ def db_get_rank(profits: int) -> str:
 
 
 # ═══════════════════════════════════════════
-#  BOT + DISPATCHER
+#  БОТ + ДИСПЕТЧЕР
 # ═══════════════════════════════════════════
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
+
+
+# ───────────────────────────────────────────
+#  ВСПОМОГАТЕЛЬНАЯ: извлечь uid из текста канала
+# ───────────────────────────────────────────
+def extract_uid_from_text(text: str) -> int | None:
+    """Пытается вытащить TG ID из текста сообщения канала."""
+    m = re.search(r'TG ID[^\d]*(\d{5,})', text or "")
+    if m:
+        return int(m.group(1))
+    return None
+
+
+# ───────────────────────────────────────────
+#  ВСПОМОГАТЕЛЬНАЯ: получить или создать заявку по req_id
+# ───────────────────────────────────────────
+def get_or_stub_request(req_id: str, message_text: str) -> dict | None:
+    """
+    Возвращает заявку из БД.
+    Если не найдена — создаёт минимальную заглушку на основе текста канала,
+    чтобы кнопки работали даже при гонке между фронтом и сервером.
+    """
+    req = db_get_request(req_id)
+    if req:
+        return req
+
+    uid = extract_uid_from_text(message_text)
+    if not uid:
+        return None
+
+    # Определяем метод из текста
+    method = "ots" if "ОТС Бот" in (message_text or "") else "garant"
+
+    db_save_request(
+        req_id=req_id,
+        uid=uid,
+        method=method,
+        ton_address="unknown",
+        links_str="",
+        msg_id=0,
+    )
+    log.info(f"[БД] Создана заглушка для заявки {req_id}, uid={uid}")
+    return db_get_request(req_id)
 
 
 # ───────────────────────────────────────────
@@ -233,6 +278,8 @@ async def handle_webapp_data(message: Message):
     except Exception as e:
         log.exception(f"Неожиданная ошибка: {e}")
         await message.answer("❌ Внутренняя ошибка. Попробуйте ещё раз.")
+
+
 # ───────────────────────────────────────────
 #  Клавиатура для заявки (в канал логов)
 # ───────────────────────────────────────────
@@ -246,7 +293,7 @@ def request_kb(req_id: str) -> InlineKeyboardMarkup:
 
 
 # ───────────────────────────────────────────
-#  Клавиатура подтверждения выплаты
+#  Клавиатура выбора суммы выплаты
 # ───────────────────────────────────────────
 def confirm_pay_kb(req_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -290,7 +337,7 @@ async def send_request_to_log(
         f"🕐 <b>Время:</b> {now} (МСК)"
     )
 
-    # Сохраняем в БД до отправки
+    # Сохраняем в БД ДО отправки — чтобы кнопки уже работали
     db_save_request(req_id, uid, method, ton_address, links_str, msg_id=0)
 
     # Отправляем в канал
@@ -322,9 +369,10 @@ async def cb_pay(call: CallbackQuery):
         return await call.answer("⛔️ Нет доступа", show_alert=True)
 
     req_id = call.data.split(":", 1)[1]
-    req    = db_get_request(req_id)
+    req    = get_or_stub_request(req_id, call.message.text or "")
+
     if not req:
-        return await call.answer("❌ Заявка не найдена", show_alert=True)
+        return await call.answer("❌ Заявка не найдена — перешли мне это сообщение из канала", show_alert=True)
     if req["status"] != "pending":
         return await call.answer(
             f"Заявка уже обработана: {req['status']}", show_alert=True
@@ -402,7 +450,8 @@ async def cb_reject(call: CallbackQuery):
         return await call.answer("⛔️ Нет доступа", show_alert=True)
 
     req_id = call.data.split(":", 1)[1]
-    req    = db_get_request(req_id)
+    req    = get_or_stub_request(req_id, call.message.text or "")
+
     if not req:
         return await call.answer("❌ Заявка не найдена", show_alert=True)
     if req["status"] != "pending":
@@ -444,13 +493,14 @@ async def cb_profile(call: CallbackQuery):
         return await call.answer("⛔️ Нет доступа", show_alert=True)
 
     req_id = call.data.split(":", 1)[1]
-    req    = db_get_request(req_id)
+    req    = get_or_stub_request(req_id, call.message.text or "")
+
     if not req:
         return await call.answer("❌ Заявка не найдена", show_alert=True)
 
     user = db_get_user(req["uid"])
     if not user:
-        return await call.answer("👤 Пользователь не найден", show_alert=True)
+        return await call.answer("👤 Пользователь не найден в базе", show_alert=True)
 
     rank       = db_get_rank(user["profits"])
     payout_pct = 65 if user["profits"] >= 60 else 60
@@ -500,7 +550,6 @@ async def _finalize_payout(call: CallbackQuery, req_id: str, ton_amount: float):
     await _do_payout(req_id, ton_amount)
 
     try:
-        # Берём текст безопасно — избегаем html_text на канальных сообщениях
         original = call.message.text or ""
         await call.message.edit_text(
             original + f"\n\n✅ <b>ВЫПЛАЧЕНО: {ton_amount} TON</b>",
@@ -514,7 +563,7 @@ async def _finalize_payout(call: CallbackQuery, req_id: str, ton_amount: float):
 
 
 async def _do_payout(req_id: str, ton_amount: float):
-    req  = db_get_request(req_id)
+    req = db_get_request(req_id)
     if not req:
         log.error(f"_do_payout: заявка {req_id} не найдена")
         return
@@ -522,11 +571,11 @@ async def _do_payout(req_id: str, ton_amount: float):
     db_set_status(req_id, "paid", ton_amount)
 
     user = db_get_user(req["uid"])
-    profits_new = (user["profits"] + 1) if user else 1
-    rank = db_get_rank(profits_new)
+    profits_new  = (user["profits"] + 1) if user else 1
+    rank         = db_get_rank(profits_new)
     method_label = "ОТС Бот" if req["method"] == "ots" else "Живой гарант"
 
-    # Канал выплат
+    # Публикуем в канал выплат
     try:
         await bot.send_message(
             PAY_CHANNEL_ID,
@@ -542,7 +591,7 @@ async def _do_payout(req_id: str, ton_amount: float):
     except Exception as e:
         log.warning(f"Не удалось отправить в PAY_CHANNEL: {e}")
 
-    # Уведомление воркеру
+    # Уведомляем воркера
     try:
         await bot.send_message(
             req["uid"],
@@ -562,13 +611,14 @@ async def _do_payout(req_id: str, ton_amount: float):
         log.warning(f"Не удалось уведомить воркера {req['uid']}: {e}")
 
 
-
-from aiohttp import web
+# ═══════════════════════════════════════════
+#  HTTP API — для мини-приложения
+# ═══════════════════════════════════════════
 
 async def handle_save_request(request):
     try:
         data = await request.json()
-        
+
         req_id      = data["req_id"]
         uid         = data["uid"]
         method      = data["method"]
@@ -581,8 +631,8 @@ async def handle_save_request(request):
         links_str = "\n".join(links) if isinstance(links, list) else links
 
         db_upsert_user(int(uid), username, full_name)
-        
-        # Если уже есть — просто обновляем msg_id
+
+        # Если уже есть — только обновляем msg_id
         existing = db_get_request(req_id)
         if existing:
             if msg_id and existing["msg_id"] == 0:
@@ -590,9 +640,10 @@ async def handle_save_request(request):
                 con.execute("UPDATE requests SET msg_id=? WHERE req_id=?", (msg_id, req_id))
                 con.commit()
                 con.close()
-            log.info(f"[API] Заявка {req_id} уже в БД, обновлён msg_id")
+            log.info(f"[API] Заявка {req_id} уже в БД, обновлён msg_id={msg_id}")
             return web.json_response({"ok": True})
 
+        # Сохраняем с реальным msg_id от фронта
         db_save_request(req_id, int(uid), method, ton_address, links_str, msg_id=msg_id)
         log.info(f"[API] Заявка {req_id} сохранена, uid={uid}, msg_id={msg_id}")
         return web.json_response({"ok": True})
@@ -601,11 +652,12 @@ async def handle_save_request(request):
         log.exception(f"[API] Ошибка сохранения заявки: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+
 async def handle_get_user_requests(request):
     try:
         uid = request.rel_url.query.get("uid")
         if not uid:
-            return web.json_response({"ok": False, "error": "no uid"}, status=400)
+            return web.json_response({"ok": False, "error": "uid не передан"}, status=400)
 
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -631,23 +683,24 @@ async def handle_get_user_requests(request):
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
+# ═══════════════════════════════════════════
+#  ЗАПУСК
+# ═══════════════════════════════════════════
 async def main():
     db_init()
-    log.info("SAM Bot запущен ✅")
+    log.info("SAM Bot запускается ✅")
 
-    # Запускаем HTTP сервер для приёма заявок от WebApp
+    # HTTP-сервер для мини-приложения
     app = web.Application()
-    app.router.add_post("/save_request", handle_save_request)
-    app.router.add_get("/get_user_requests", handle_get_user_requests)
+    app.router.add_post("/save_request",       handle_save_request)
+    app.router.add_get("/get_user_requests",   handle_get_user_requests)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    log.info("HTTP сервер запущен на порту 8080 ✅")
+    log.info("HTTP-сервер запущен на порту 8080 ✅")
 
     await dp.start_polling(bot, skip_updates=True)
-
-
 
 
 if __name__ == "__main__":
