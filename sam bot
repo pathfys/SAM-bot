@@ -53,6 +53,10 @@ DB_PATH = "sam.db"
 
 
 def db_init():
+    try:
+    cur.execute("ALTER TABLE users ADD COLUMN photo_url TEXT DEFAULT ''")
+    except:
+    pass
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -214,6 +218,12 @@ def get_or_stub_request(req_id: str, message_text: str) -> dict | None:
 async def cmd_start(message: Message):
     user = message.from_user
     db_upsert_user(user.id, user.username, user.full_name)
+photo_url = await get_telegram_photo(user.id)
+if photo_url:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE users SET photo_url=? WHERE uid=?", (photo_url, user.id))
+    con.commit()
+    con.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -683,6 +693,46 @@ async def handle_get_user_requests(request):
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
+async def get_telegram_photo(uid: int) -> str:
+    try:
+        photos = await bot.get_user_profile_photos(uid, limit=1)
+        if photos.total_count > 0:
+            file_id = photos.photos[0][0].file_id
+            file = await bot.get_file(file_id)
+            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+    except Exception as e:
+        log.warning(f"Не удалось получить фото для {uid}: {e}")
+    return ""
+
+async def handle_get_leaderboard(request):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT uid, username, full_name, profits, total_ton, photo_url
+            FROM users
+            WHERE total_ton > 0 OR profits > 0
+            ORDER BY total_ton DESC, profits DESC
+            LIMIT 50
+        """).fetchall()
+        con.close()
+
+        board = [
+            {
+                "uid":       row["uid"],
+                "username":  row["username"] or "",
+                "full_name": row["full_name"] or "",
+                "profits":   row["profits"] or 0,
+                "total_ton": row["total_ton"] or 0,
+                "photo_url": row["photo_url"] or "",
+            }
+            for row in rows
+        ]
+        return web.json_response({"ok": True, "board": board})
+    except Exception as e:
+        log.exception(f"[API] Ошибка get_leaderboard: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
 # ═══════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════
@@ -694,6 +744,7 @@ async def main():
     app = web.Application()
     app.router.add_post("/save_request",       handle_save_request)
     app.router.add_get("/get_user_requests",   handle_get_user_requests)
+    app.router.add_get("/get_leaderboard",     handle_get_leaderboard)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
