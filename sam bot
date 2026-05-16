@@ -679,6 +679,7 @@ async def handle_save_request(request):
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
+
 async def handle_get_user_requests(request):
     try:
         uid = request.rel_url.query.get("uid")
@@ -687,10 +688,16 @@ async def handle_get_user_requests(request):
 
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
+        
         rows = con.execute(
             "SELECT req_id, status, ton_amount FROM requests WHERE uid=? ORDER BY created_at DESC LIMIT 50",
             (int(uid),)
         ).fetchall()
+        
+        user_row = con.execute(
+            "SELECT profits, total_ton FROM users WHERE uid=?", (int(uid),)
+        ).fetchone()
+        
         con.close()
 
         requests_list = [
@@ -702,7 +709,12 @@ async def handle_get_user_requests(request):
             for row in rows
         ]
 
-        return web.json_response({"ok": True, "requests": requests_list})
+        return web.json_response({
+            "ok":        True,
+            "requests":  requests_list,
+            "profits":   user_row["profits"]   if user_row else 0,
+            "total_ton": user_row["total_ton"] if user_row else 0,
+        })
 
     except Exception as e:
         log.exception(f"[API] Ошибка get_user_requests: {e}")
