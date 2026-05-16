@@ -35,7 +35,7 @@ BOT_TOKEN      = "8556040583:AAH4alGtztA9F4kWTL1QIh2W-oP-0EYrmR0"
 ADMIN_IDS      = [8509231132]
 LOG_CHANNEL_ID = -1003780614361
 PAY_CHANNEL_ID = -1003775233889
-WEBAPP_URL = "https://alexandria-websites-equation-css.trycloudflare.com"
+WEBAPP_URL     = "https://alexandria-websites-equation-css.trycloudflare.com"
 
 # ═══════════════════════════════════════════
 #  ЛОГГЕР
@@ -53,10 +53,6 @@ DB_PATH = "sam.db"
 
 
 def db_init():
-    try:
-    cur.execute("ALTER TABLE users ADD COLUMN photo_url TEXT DEFAULT ''")
-    except:
-    pass
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -83,6 +79,10 @@ def db_init():
             msg_id      INTEGER DEFAULT 0
         )
     """)
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN photo_url TEXT DEFAULT ''")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
@@ -212,18 +212,34 @@ def get_or_stub_request(req_id: str, message_text: str) -> dict | None:
 
 
 # ───────────────────────────────────────────
+#  Получение фото профиля из Telegram
+# ───────────────────────────────────────────
+async def get_telegram_photo(uid: int) -> str:
+    try:
+        photos = await bot.get_user_profile_photos(uid, limit=1)
+        if photos.total_count > 0:
+            file_id = photos.photos[0][0].file_id
+            file = await bot.get_file(file_id)
+            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+    except Exception as e:
+        log.warning(f"Не удалось получить фото для {uid}: {e}")
+    return ""
+
+
+# ───────────────────────────────────────────
 #  /start
 # ───────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user = message.from_user
     db_upsert_user(user.id, user.username, user.full_name)
-photo_url = await get_telegram_photo(user.id)
-if photo_url:
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE users SET photo_url=? WHERE uid=?", (photo_url, user.id))
-    con.commit()
-    con.close()
+
+    photo_url = await get_telegram_photo(user.id)
+    if photo_url:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE users SET photo_url=? WHERE uid=?", (photo_url, user.id))
+        con.commit()
+        con.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -693,17 +709,6 @@ async def handle_get_user_requests(request):
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
-async def get_telegram_photo(uid: int) -> str:
-    try:
-        photos = await bot.get_user_profile_photos(uid, limit=1)
-        if photos.total_count > 0:
-            file_id = photos.photos[0][0].file_id
-            file = await bot.get_file(file_id)
-            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-    except Exception as e:
-        log.warning(f"Не удалось получить фото для {uid}: {e}")
-    return ""
-
 async def handle_get_leaderboard(request):
     try:
         con = sqlite3.connect(DB_PATH)
@@ -733,6 +738,7 @@ async def handle_get_leaderboard(request):
         log.exception(f"[API] Ошибка get_leaderboard: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+
 # ═══════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════
@@ -740,16 +746,29 @@ async def main():
     db_init()
     log.info("SAM Bot запускается ✅")
 
-    # HTTP-сервер для мини-приложения
-    app = web.Application()
-    app.router.add_post("/save_request",       handle_save_request)
-    app.router.add_get("/get_user_requests",   handle_get_user_requests)
-    app.router.add_get("/get_leaderboard",     handle_get_leaderboard)
+    @web.middleware
+    async def cors_middleware(request, handler):
+        if request.method == "OPTIONS":
+            return web.Response(status=200, headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            })
+        response = await handler(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_post("/save_request",     handle_save_request)
+    app.router.add_get("/get_user_requests", handle_get_user_requests)
+    app.router.add_get("/get_leaderboard",   handle_get_leaderboard)
+    app.router.add_route("OPTIONS", "/save_request", lambda r: web.Response(status=200))
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    site = web.TCPSite(runner, "0.0.0.0", 8085)
     await site.start()
-    log.info("HTTP-сервер запущен на порту 8080 ✅")
+    log.info("HTTP сервер запущен на порту 8085 ✅")
 
     await dp.start_polling(bot, skip_updates=True)
 
